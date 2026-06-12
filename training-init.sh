@@ -9,24 +9,24 @@
 #
 # Idempotent und nicht-blockierend: Fehler beenden das Skript mit !=0,
 # der Aufruf in den Crucible-Args sollte mit "|| true" abgesichert sein.
- 
+
 set -u
- 
+
 log() { echo "[training-init] $*"; }
- 
+
 # Env-Datei defensiv nachladen, falls das Skript mal anders aufgerufen wird
 [ -f /etc/crucible/env ] && . /etc/crucible/env
- 
+
 : "${STUDENT_HASH:?STUDENT_HASH fehlt}"
 : "${TRAINING_CONFIG_URL:?TRAINING_CONFIG_URL fehlt}"
 : "${TRAINING_CONFIG_TOKEN:?TRAINING_CONFIG_TOKEN fehlt}"
- 
+
 HOME_DIR="${HOME:-/home/coder}"
 WORKSPACE="${TRAINING_WORKSPACE:-$HOME_DIR/workspace}"
 SSH_DIR="$HOME_DIR/.ssh"
 KEY_FILE="$SSH_DIR/id_ed25519_training"
 CONF_FILE="/tmp/student-config.json"
- 
+
 # 1. Per-Student-Config holen (GitHub Contents API, raw)
 log "Hole Konfiguration für $STUDENT_HASH ..."
 if ! curl -fsSL \
@@ -36,19 +36,19 @@ if ! curl -fsSL \
   log "FEHLER: Konfiguration nicht abrufbar — Provisioning evtl. noch nicht gelaufen."
   exit 1
 fi
- 
+
 json() { python3 -c "import json,sys;print(json.load(open('$CONF_FILE'))[sys.argv[1]])" "$1"; }
- 
+
 REPO_SSH_URL="$(json repo_ssh_url)"
 REPO_NAME="$(json repo_name)"
 GIT_USER_NAME="$(json git_user_name)"
 GIT_USER_EMAIL="$(json git_user_email)"
- 
+
 # 2. Deploy Key einrichten
 mkdir -p "$SSH_DIR" && chmod 700 "$SSH_DIR"
 python3 -c "import json;print(json.load(open('$CONF_FILE'))['deploy_key_private'],end='')" > "$KEY_FILE"
 chmod 600 "$KEY_FILE"
- 
+
 # SSH-Config nur ergänzen, wenn noch nicht vorhanden
 if ! grep -qs "id_ed25519_training" "$SSH_DIR/config" 2>/dev/null; then
   cat >> "$SSH_DIR/config" <<EOF
@@ -60,7 +60,7 @@ Host github.com
 EOF
   chmod 600 "$SSH_DIR/config"
 fi
- 
+
 # GitHub-Hostkeys pinnen (kein interaktives Bestätigen beim ersten Clone)
 if ! grep -qs "github.com" "$SSH_DIR/known_hosts" 2>/dev/null; then
   cat >> "$SSH_DIR/known_hosts" <<'EOF'
@@ -70,34 +70,44 @@ github.com ssh-rsa AAAAB3NzaC1yc2EAAAADAQABAAABgQCj7ndNxQowgcQnjshcLrqPEiiphnt+V
 EOF
   chmod 600 "$SSH_DIR/known_hosts"
 fi
- 
+
 # 3. Repo in den Workspace-Root holen (idempotent; Verzeichnis ist wegen
 #    lost+found nie leer, daher init+fetch+checkout statt clone)
 TARGET="$WORKSPACE"
 mkdir -p "$TARGET"
-if [ -d "$TARGET/.git" ]; then
-  log "Repo existiert bereits — aktualisiere Remotes."
-  git -C "$TARGET" fetch --all --tags --quiet || log "WARNUNG: fetch fehlgeschlagen."
-else
-  log "Hole $REPO_SSH_URL nach $TARGET ..."
+
+# Der Workspace ist ein Volume-Mountpoint und gehört root, Git läuft als
+# coder — ohne safe.directory verweigert Git jede Operation darin.
+git config --global --add safe.directory "$TARGET"
+
+if [ ! -d "$TARGET/.git" ]; then
   git init --quiet "$TARGET"
-  git -C "$TARGET" remote add origin "$REPO_SSH_URL"
-  if ! git -C "$TARGET" fetch --tags --quiet origin; then
-    log "FEHLER: Fetch fehlgeschlagen."
-    exit 1
-  fi
+fi
+git -C "$TARGET" remote add origin "$REPO_SSH_URL" 2>/dev/null \
+  || git -C "$TARGET" remote set-url origin "$REPO_SSH_URL"
+
+if ! git -C "$TARGET" fetch --tags --quiet origin; then
+  log "FEHLER: Fetch fehlgeschlagen."
+  exit 1
+fi
+
+if git -C "$TARGET" rev-parse --verify HEAD >/dev/null 2>&1; then
+  log "Repo bereits ausgecheckt — Stand aktualisiert (fetch)."
+else
   DEFAULT_BRANCH="$(git -C "$TARGET" ls-remote --symref origin HEAD \
     | awk '/^ref:/ {sub("refs/heads/","",$2); print $2}')"
   DEFAULT_BRANCH="${DEFAULT_BRANCH:-main}"
-  git -C "$TARGET" checkout --quiet -b "$DEFAULT_BRANCH" --track "origin/$DEFAULT_BRANCH"
+  log "Checke $DEFAULT_BRANCH aus ..."
+  git -C "$TARGET" checkout --quiet -f -B "$DEFAULT_BRANCH" "origin/$DEFAULT_BRANCH"
+  git -C "$TARGET" branch --quiet --set-upstream-to "origin/$DEFAULT_BRANCH" "$DEFAULT_BRANCH"
   # Volume-Artefakte aus dem Git-Status ausblenden
   echo "lost+found" >> "$TARGET/.git/info/exclude"
 fi
- 
+
 # 4. Git-Identität setzen (nur im Repo, nicht global)
 git -C "$TARGET" config user.name "$GIT_USER_NAME"
 git -C "$TARGET" config user.email "$GIT_USER_EMAIL"
- 
+
 rm -f "$CONF_FILE"
 log "Fertig: $REPO_NAME ist eingerichtet."
 exit 0
